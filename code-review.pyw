@@ -1,5 +1,7 @@
 # -*- coding: UTF-8 -*-
 
+import json
+import math
 import os
 import re
 import subprocess as sub
@@ -89,22 +91,23 @@ def get_review_record_from_file(lastReviewRecordPath):
 def save_review_record(repos_record):
     global reviewed_commit_record_path
     with open(reviewed_commit_record_path, 'w') as f:
-        f.write(str(repos_record))
+        f.write(json.dumps(repos_record))
 
 
 def get_repos_path_from_cfg():
-    repos = {}
     cfg = cfg_path + '/code-review.cfg'
     if not os.path.exists(cfg):
         print cfg + ' not exist'
         return ''
     with open(cfg, 'r') as f:
         repos = eval(f.read())
-    return repos['base_dir']
+    return repos or {}
 
 
-def save_cfg(repo_base_dir):
-    repos = {'base_dir': repo_base_dir}
+def save_cfg():
+    global repos_base_val
+    global compare_tool_path
+    repos = {'base_dir': repos_base_val.get(), 'compare_tool': compare_tool_path.get()}
     with open(cfg_path + '/code-review.cfg', 'w') as f:
         f.write(str(repos))
 
@@ -127,6 +130,7 @@ def checkout_version(base_dir, repo_name, code_url, commit_id):
     cmd = "cd %s && git checkout %s" % (repo_dir, commit_id)
     checkout_result = sub.check_output(cmd, stderr=sub.STDOUT, shell=True)
     print checkout_result
+    sub.Popen([cmd], shell=True)
 
 
 def checkout_latest(base_dir, repo_name, code_url):
@@ -138,7 +142,7 @@ def checkout_latest(base_dir, repo_name, code_url):
                                         stderr=sub.STDOUT, shell=True)
         print reset_result
         cmd = "cd %s && git pull --rebase" % repo_dir
-    os.system(cmd)
+    sub.Popen([cmd], shell=True)
 
 
 def get_diff_file_list(repo_path, commit_id_former):
@@ -154,14 +158,27 @@ def get_diff_file_list(repo_path, commit_id_former):
 
 def diff_repos(repo_name):
     global repos_items_widgets_dict
+    global compare_tool_path
+    global review_time_cost_dict
+    global total_review_time
+    start_time = time.time()
+
+    diff_tool_path = compare_tool_path.get()
+    if not os.path.exists(diff_tool_path):
+        showerror('Error', 'A valid compare tool must be specified')
+
+    diff_tool_path = 'idea.bat diff'
     latest_dir = "%s\\%s\\latest" % (diff_dir, repo_name)
     reviewed_dir = "%s\\%s\\reviewed" % (diff_dir, repo_name)
-    diff_tool_path = r'idea.bat diff'
     cmd = "\"%s\" %s %s" % (diff_tool_path, reviewed_dir, latest_dir)
     repos_items_widgets_dict[repo_name]['review_btn']['bg'] = 'red'
     show_infon(cmd)
     os.system(cmd)
     repos_items_widgets_dict[repo_name]['review_btn']['bg'] = 'gray'
+    end_time = time.time()
+    review_cost = math.floor(end_time - start_time)
+    review_time_cost_dict[repo_name].set(review_cost)
+    total_review_time.set(total_review_time.get() + review_cost)
 
 
 def get_latest_log(repo_dir):
@@ -181,16 +198,19 @@ def update_repo_commit_id(base_dir, repos_list):
     return repos_commit_id_dict
 
 
-def prepare_review(reviewed_commit_id_dict):
+def prepare_review(option_handler, review_date, parent_frm):
+    reviewed_commit_id_dict = {}
     if not os.path.exists(base_dir):
         showerror("Error", "Code root path is blank !")
         return
+
+    clear_repo_review_action_bar()
 
     global repo_list_frm
     global repos_file_change_number_dict
     start_time = time.time()
     repos_url_dict = get_repo_url(base_dir)
-    reviewed_commit_id_dict = get_latest_reviewed_record_from_file(reviewed_commit_record_path)
+    reviewed_commit_id_dict = review_record_dict[review_date.get()] or {}
     repos_latest_log_dict = get_latest_log_dict_under_dir(base_dir)
     if len(reviewed_commit_id_dict) == 0:
         reviewed_commit_id_dict = update_repo_commit_id(base_dir, repos_url_dict.keys())
@@ -203,7 +223,6 @@ def prepare_review(reviewed_commit_id_dict):
             repos_file_change_number_dict[repo] = IntVar()
         repos_file_change_number_dict[repo].set(len(file_list))
 
-    clear_repo_review_action_bar()
     create_repo_review_action_bar(repo_list_frm, base_dir, repos_latest_log_dict)
 
     end_time = time.time()
@@ -211,6 +230,8 @@ def prepare_review(reviewed_commit_id_dict):
     show_infon('---------------------------------------------------')
     show_infon("Time Cost : %f s" % time_consum)
     show_infon("!!! Prepare Done !!!")
+    create_reviewed_history()
+    flush_review_history_drop_down(option_handler, parent_frm, review_date, review_record_dict)
     return reviewed_commit_id_dict
 
 
@@ -231,11 +252,12 @@ def save_file_change_number(lastReviewRecordPath):
 
 
 def create_reviewed_history():
+    global review_record_dict
     if not os.path.exists(base_dir):
         showerror("Error", "Code root path is blank !")
         return
 
-    current_review_record = get_review_record_from_file(reviewed_commit_record_path)
+    review_record_dict = get_review_record_from_file(reviewed_commit_record_path)
     commit_id_dict = {}
     for d in os.listdir(base_dir):
         path = base_dir + '/' + d
@@ -249,10 +271,25 @@ def create_reviewed_history():
                 commit_id_dict[d] = repo_dict
             except sub.CalledProcessError, exc:
                 pass
-    current_review_record[time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())] = commit_id_dict
-    save_review_record(current_review_record)
-    print 'Review baseline create done !'
+    review_record_dict[time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())] = commit_id_dict
+    save_review_record(review_record_dict)
     return commit_id_dict
+
+
+def flush_review_history_drop_down(option_handler, parent_frm, review_date, review_record_dict):
+    options = review_record_dict.keys()
+    options.sort()
+    review_date.set(options[len(options) - 1])
+    row = 0
+    col = 6
+    option_handler.destroy()
+    option_handler = OptionMenu(parent_frm, review_date, *options or ' ')
+    option_handler.grid(row=row, column=col)
+    print 'Review baseline created !'
+
+
+def upload_review_record():
+    pass
 
 
 def copy_diff_files(repo_name, file_list):
@@ -283,6 +320,7 @@ def run_copy(from_dir, to_dir, file_list):
         del_file(to_dir)
     else:
         os.makedirs(to_dir)
+
     for f in file_list:
         file_to_dir = to_dir + "/" + os.path.dirname(f)
         if not os.path.exists(file_to_dir):
@@ -295,26 +333,23 @@ def run_copy(from_dir, to_dir, file_list):
     show_infon("copy %d files from %s to %s" % (len(file_list), from_dir, to_dir))
 
 
-# 1. 遍历目录收集前一次review的记录
-# 2. 拉取最新代码
-# 3. 拉取上一次review版本的代码
-# 4. 获取change file list
-# 5. 复制最新代码和上次review代码
-# 6. 比较打开
-# 7. 更新review记录
-
-repos_file_change_number_dict = {}
-
-
 def select_base_dir():
     global repos_base_val
-    dir_path = tkFileDialog.askdirectory(title='Open code repos root diretory',
+    dir_path = tkFileDialog.askdirectory(title='Open code repos root directory',
                                          initialdir=os.path.dirname(repos_base_val.get()),
                                          mustexist=True)
     repos_base_val.set(dir_path)
     update_base_dir(dir_path)
     get_repo_url(dir_path)
-    save_cfg(dir_path)
+    save_cfg()
+
+
+def select_compare_tool():
+    global compare_tool_path
+    tool_path = tkFileDialog.askopenfilename(title='Compare tool',
+                                             initialdir=compare_tool_path.get())
+    compare_tool_path.set(tool_path)
+    save_cfg()
 
 
 def generate_item(frm):
@@ -341,11 +376,17 @@ def clear_repo_review_action_bar():
 def create_repo_review_action_bar(repo_list_frm, base_dir, repos_name_list):
     global repos_items_widgets_dict
     global repos_file_change_number_dict
+    global review_time_cost_dict
     item_row = 0
     for repo_name in repos_name_list:
         if not repos_file_change_number_dict.has_key(repo_name):
             repos_file_change_number_dict[repo_name] = IntVar()
             repos_file_change_number_dict[repo_name].set(0)
+
+        if not review_time_cost_dict.has_key(repo_name):
+            review_time_cost_dict[repo_name] = IntVar()
+            review_time_cost_dict[repo_name].set(0)
+
         repo_path = "%s/%s" % (base_dir, repo_name)
         repos_widgets = {}
         col = 0
@@ -359,9 +400,9 @@ def create_repo_review_action_bar(repo_list_frm, base_dir, repos_name_list):
         repos_widgets['latest_log'].grid(row=item_row, column=col)
         col += 1
 
-        repos_widgets['change_file_num'] = (
-            Entry(repo_list_frm, width=5, textvariable=repos_file_change_number_dict[repo_name], justify=CENTER,
-                  relief=RAISED))
+        repos_widgets['change_file_num'] = Entry(repo_list_frm, width=5,
+                                                 textvariable=repos_file_change_number_dict[repo_name], justify=CENTER,
+                                                 relief=RAISED)
         repos_widgets['change_file_num'].grid(row=item_row, column=col)
         col += 1
 
@@ -369,33 +410,49 @@ def create_repo_review_action_bar(repo_list_frm, base_dir, repos_name_list):
             color = 'green'
         else:
             color = 'gray'
-        repos_widgets['review_btn'] = (Button(repo_list_frm, width=5, text=u"review", bg=color,
-                                              command=lambda name=repo_name: diff_repos(name)))
+        repos_widgets['review_btn'] = Button(repo_list_frm, width=5, text=u"review", bg=color,
+                                             command=lambda name=repo_name: diff_repos(name))
         repos_widgets['review_btn'].grid(row=item_row, column=col)
+        col += 1
+
+        repos_widgets['review_time'] = Entry(repo_list_frm, width=5,
+                                             textvariable=review_time_cost_dict[repo_name], justify=CENTER,
+                                             relief=RAISED)
+        repos_widgets['review_time'].grid(row=item_row, column=col)
 
         repos_items_widgets_dict[repo_name] = repos_widgets
         item_row = item_row + 1
 
 
+def get_latest_reviewed_record(record_dict):
+    options = record_dict.keys()
+    options.sort()
+    latestKey = options[len(options) - 1]
+    return record_dict[latestKey]
+
+
+# 1. 遍历目录收集前一次review的记录
+# 2. 拉取最新代码
+# 3. 拉取上一次review版本的代码
+# 4. 获取change file list
+# 5. 复制最新代码和上次review代码
+# 6. 比较打开
+# 7. 更新review记录
+
+repos_file_change_number_dict = {}
+review_time_cost_dict = {}
 review_record_dict = {}
 reviewed_commit_id_dict = {}
 repos_items_widgets_dict = {}
-
-
-def get_latest_reviewed_record_from_file(reviewed_commit_record):
-    global review_record_dict
-    review_record_dict = get_review_record_from_file(reviewed_commit_record)
-    record_time = review_record_dict.keys()
-    record_time.reverse()
-    return review_record_dict[record_time[0]]
-
+review_date = ''
 
 if __name__ == '__main__':
     top = Tk()
 
     cfg_path = os.path.dirname(sys.argv[0])
+    cfg = get_repos_path_from_cfg()
+    update_base_dir(cfg['base_dir'])
 
-    update_base_dir(get_repos_path_from_cfg())
     if os.path.exists(base_dir):
         if not os.path.exists(diff_dir):
             os.mkdir(diff_dir)
@@ -404,26 +461,59 @@ if __name__ == '__main__':
         if not os.path.exists(reviewed_commit_record_path):
             create_reviewed_history()
         review_record_dict = get_review_record_from_file(reviewed_commit_record_path)
-        reviewed_commit_id_dict = get_latest_reviewed_record_from_file(reviewed_commit_record_path)
+        reviewed_commit_id_dict = get_latest_reviewed_record(review_record_dict)
 
-    repos_review = {}
-
-    repos_base_val = StringVar()
-    repos_base_val.set(base_dir)
-
-    main_frm = Frame(top)
     review_date = StringVar()
     options = review_record_dict.keys()
     options.sort()
-    review_date.set(options[0])
-    OptionMenu(main_frm, review_date, *options).pack(side=LEFT)
-    Label(main_frm, text=r"Code root path ").pack(side=LEFT)
-    Entry(main_frm, textvariable=repos_base_val).pack(side=LEFT)
-    Button(main_frm, text=u'..', command=select_base_dir).pack(side=LEFT)
-    Button(main_frm, text=u'Get Latest Code !',
-           command=lambda reviewed=reviewed_commit_id_dict: prepare_review(reviewed)).pack(side=LEFT)
-    Button(main_frm, text=u'Create Review Baseline !', command=create_reviewed_history).pack()
+    if len(options) > 0:
+        review_date.set(options[len(options) - 1])
+
+    repos_review = {}
+    repos_base_val = StringVar()
+    repos_base_val.set(base_dir)
+    compare_tool_path = StringVar()
+    compare_tool_path.set(cfg['compare_tool'])
+    total_review_time = IntVar()
+    total_review_time.set(0)
+
+    main_frm = Frame(top)
+    main_frm_grid_col = 0
+    main_frm_grid_row = 0
+
+    Label(main_frm, text=r"Compare").grid(row=main_frm_grid_row, column=main_frm_grid_col)
+    main_frm_grid_col += 1
+    Entry(main_frm, textvariable=compare_tool_path).grid(row=main_frm_grid_row, column=main_frm_grid_col)
+    main_frm_grid_col += 1
+    Button(main_frm, text=u'..', command=select_compare_tool).grid(row=main_frm_grid_row, column=main_frm_grid_col)
+    main_frm_grid_col += 1
+
+    Label(main_frm, text=r"Code").grid(row=main_frm_grid_row, column=main_frm_grid_col)
+    main_frm_grid_col += 1
+    Entry(main_frm, textvariable=repos_base_val).grid(row=main_frm_grid_row, column=main_frm_grid_col)
+    main_frm_grid_col += 1
+    Button(main_frm, text=u'..', command=select_base_dir).grid(row=main_frm_grid_row, column=main_frm_grid_col)
+    main_frm_grid_col += 1
+
+    Label(main_frm, text=r"Reviewed").grid(row=main_frm_grid_row, column=main_frm_grid_col)
+    main_frm_grid_col += 1
+    review_record_drop = OptionMenu(main_frm, review_date, *options or ' ')
+    review_record_drop.grid(row=main_frm_grid_row, column=main_frm_grid_col)
+    main_frm_grid_col += 1
+
+    Button(main_frm, text=u'Get Code Diff',
+           command=lambda option_handler=review_record_drop, review_date=review_date,
+                          parent_frm=main_frm: prepare_review(option_handler, review_date, parent_frm)) \
+        .grid(row=main_frm_grid_row, column=main_frm_grid_col)
+    main_frm_grid_col += 1
+
+    Entry(main_frm, textvariable=total_review_time, width=8, justify=CENTER).grid(row=main_frm_grid_row,
+                                                                                  column=main_frm_grid_col)
+    main_frm_grid_col += 1
+
     main_frm.pack()
+
+    flush_review_history_drop_down(review_record_drop, main_frm, review_date, review_record_dict)
 
     repo_list_frm = Frame(top)
     create_repo_review_action_bar(repo_list_frm, base_dir, reviewed_commit_id_dict.keys())
@@ -439,4 +529,5 @@ if __name__ == '__main__':
     sts_frm.pack()
 
     top.title(u"code review helper")
+
     top.mainloop()
